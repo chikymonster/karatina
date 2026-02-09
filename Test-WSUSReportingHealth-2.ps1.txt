@@ -1,0 +1,347 @@
+<#
+.SYNOPSIS
+    WSUS Reporting Health Check
+    
+.DESCRIPTION
+    Verifies that all components of the WSUS reporting solution are properly configured and functioning.
+    Use this to diagnose issues or verify successful deployment.
+    
+.PARAMETER SqlServer
+    SQL Server instance hosting SUSDB
+    
+.PARAMETER Database
+    Database name (default: SUSDB)
+    
+.EXAMPLE
+    .\Test-WSUSReportingHealth.ps1 -SqlServer "WSUSSQL01"
+    
+.NOTES
+    Run this after initial deployment to verify everything is working correctly.
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$SqlServer,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$Database = "SUSDB"
+)
+
+$ErrorActionPreference = "Continue"
+$script:IssuesFound = 0
+$script:ChecksPassed = 0
+
+function Write-Status {
+    param(
+        [string]$Message,
+        [ValidateSet('Info','Success','Warning','Error')]
+        [string]$Type = 'Info'
+    )
+    
+    $icon = switch ($Type) {
+        'Info'    { 'ℹ️' }
+        'Success' { '✓' }
+        'Warning' { '⚠️' }
+        'Error'   { '✗' }
+    }
+    
+    $color = switch ($Type) {
+        'Info'    { 'Cyan' }
+        'Success' { 'Green' }
+        'Warning' { 'Yellow' }
+        'Error'   { 'Red' }
+    }
+    
+    Write-Host "$icon $Message" -ForegroundColor $color
+}
+
+function Test-SqlConnection {
+    param([string]$ServerInstance, [string]$DatabaseName)
+    
+    try {
+        $connectionString = "Server=$ServerInstance;Database=$DatabaseName;Integrated Security=True;TrustServerCertificate=True;Connection Timeout=5;"
+        $connection = New-Object System.Data.SqlClient.SqlConnection($connectionString)
+        $connection.Open()
+        $connection.Close()
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Invoke-SqlQuery {
+    param([string]$Query, [string]$ServerInstance, [string]$DatabaseName)
+    
+    try {
+        $connectionString = "Server=$ServerInstance;Database=$DatabaseName;Integrated Security=True;TrustServerCertificate=True;"
+        $connection = New-Object System.Data.SqlClient.SqlConnection($connectionString)
+        $connection.Open()
+        
+        $command = $connection.CreateCommand()
+        $command.CommandText = $Query
+        $command.CommandTimeout = 30
+        
+        $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($command)
+        $dataset = New-Object System.Data.DataSet
+        $adapter.Fill($dataset) | Out-Null
+        
+        $connection.Close()
+        
+        return $dataset.Tables[0]
+    }
+    catch {
+        return $null
+    }
+}
+
+Write-Host ""
+Write-Host "═══════════════════════════════════════════════════════════" -ForegroundColor White
+Write-Host "       WSUS REPORTING SOLUTION - HEALTH CHECK" -ForegroundColor White
+Write-Host "═══════════════════════════════════════════════════════════" -ForegroundColor White
+Write-Host ""
+
+# Test 1: SQL Server Connectivity
+Write-Status "Testing SQL Server connectivity..." -Type Info
+if (Test-SqlConnection -ServerInstance $SqlServer -DatabaseName $Database) {
+    Write-Status "  SQL Server connection successful" -Type Success
+    $script:ChecksPassed++
+} else {
+    Write-Status "  Failed to connect to SQL Server: $SqlServer" -Type Error
+    Write-Status "  Check: Network connectivity, firewall, SQL Server service" -Type Warning
+    $script:IssuesFound++
+}
+
+# Test 2: SUSDB Database Access
+Write-Status "`nVerifying SUSDB database access..." -Type Info
+$query = "SELECT COUNT(*) as ComputerCount FROM dbo.tbComputerTarget WHERE IsDeleted = 0"
+$result = Invoke-SqlQuery -Query $query -ServerInstance $SqlServer -DatabaseName $Database
+
+if ($result -and $result.ComputerCount -ge 0) {
+    Write-Status "  SUSDB access verified - Found $($result.ComputerCount) computers" -Type Success
+    $script:ChecksPassed++
+} else {
+    Write-Status "  Failed to query SUSDB" -Type Error
+    Write-Status "  Check: Database permissions, WSUS database integrity" -Type Warning
+    $script:IssuesFound++
+}
+
+# Test 3: Required SQL Views
+Write-Status "`nChecking SQL views..." -Type Info
+$requiredViews = @(
+    'vw_OverallCompliance',
+    'vw_ComplianceByClassification',
+    'vw_MissingSecurityUpdates',
+    'vw_NonReportingSystems',
+    'vw_ComplianceBySystemType',
+    'vw_TopNonCompliantSystems'
+)
+
+$viewQuery = @"
+SELECT TABLE_NAME 
+FROM INFORMATION_SCHEMA.VIEWS 
+WHERE TABLE_NAME IN ('$($requiredViews -join "','")') 
+AND TABLE_SCHEMA = 'dbo'
+"@
+
+$existingViews = Invoke-SqlQuery -Query $viewQuery -ServerInstance $SqlServer -DatabaseName $Database
+
+if ($existingViews) {
+    $existingViewNames = $existingViews | ForEach-Object { $_.TABLE_NAME }
+    $missingViews = $requiredViews | Where-Object { $_ -notin $existingViewNames }
+    
+    if ($missingViews.Count -eq 0) {
+        Write-Status "  All 6 required views found" -Type Success
+        $script:ChecksPassed++
+    } else {
+        Write-Status "  Missing views: $($missingViews -join ', ')" -Type Error
+        Write-Status "  Run the SQL scripts in sql-views folder" -Type Warning
+        $script:IssuesFound++
+    }
+    
+    # Test each view for data
+    foreach ($view in $existingViewNames) {
+        $testQuery = "SELECT TOP 1 * FROM $view"
+        $testResult = Invoke-SqlQuery -Query $testQuery -ServerInstance $SqlServer -DatabaseName $Database
+        if ($testResult) {
+            Write-Status "    ✓ $view - Returns data" -Type Success
+        } else {
+            Write-Status "    ✗ $view - No data or query failed" -Type Warning
+        }
+    }
+} else {
+    Write-Status "  No views found - Run SQL scripts first" -Type Error
+    $script:IssuesFound++
+}
+
+# Test 4: PowerShell Scripts
+Write-Status "`nChecking PowerShell scripts..." -Type Info
+$scriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
+$requiredScripts = @(
+    'Generate-WSUSReports.ps1',
+    'Export-WSUSDataToCSV.ps1',
+    'Setup-AutomatedReporting.ps1'
+)
+
+$scriptsFound = 0
+foreach ($script in $requiredScripts) {
+    $scriptPath = Join-Path $scriptDirectory $script
+    if (Test-Path $scriptPath) {
+        Write-Status "  ✓ Found: $script" -Type Success
+        $scriptsFound++
+    } else {
+        Write-Status "  ✗ Missing: $script" -Type Error
+        $script:IssuesFound++
+    }
+}
+
+if ($scriptsFound -eq 3) {
+    $script:ChecksPassed++
+}
+
+# Test 5: Scheduled Tasks
+Write-Status "`nChecking scheduled tasks..." -Type Info
+$wsusTaskNames = @(
+    'WSUS-WeeklyReport',
+    'WSUS-DailySummary',
+    'WSUS-ReportCleanup'
+)
+
+$tasksFound = 0
+foreach ($taskName in $wsusTaskNames) {
+    $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    if ($task) {
+        $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName
+        $lastRun = if ($taskInfo.LastRunTime -eq [DateTime]::MinValue) { "Never" } else { $taskInfo.LastRunTime.ToString("yyyy-MM-dd HH:mm") }
+        $lastResult = $taskInfo.LastTaskResult
+        
+        if ($lastResult -eq 0 -or $lastRun -eq "Never") {
+            Write-Status "  ✓ $taskName - State: $($task.State), Last Run: $lastRun" -Type Success
+            $tasksFound++
+        } else {
+            Write-Status "  ⚠️ $taskName - Last run failed (Code: $lastResult)" -Type Warning
+            Write-Status "    Last Run: $lastRun" -Type Info
+        }
+    } else {
+        Write-Status "  ✗ $taskName - Not found" -Type Warning
+        Write-Status "    Run Setup-AutomatedReporting.ps1 to create" -Type Info
+    }
+}
+
+if ($tasksFound -eq 3) {
+    $script:ChecksPassed++
+}
+
+# Test 6: Report Output Directory
+Write-Status "`nChecking report directories..." -Type Info
+$reportPaths = @(
+    "C:\WSUSReports"
+)
+
+foreach ($path in $reportPaths) {
+    if (Test-Path $path) {
+        $reportFiles = Get-ChildItem -Path $path -Filter "WSUS_Report_*.html" -ErrorAction SilentlyContinue
+        if ($reportFiles) {
+            $latestReport = $reportFiles | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            $daysOld = (Get-Date) - $latestReport.LastWriteTime
+            Write-Status "  ✓ $path exists - Latest report: $($latestReport.Name) ($([math]::Round($daysOld.TotalDays)) days old)" -Type Success
+        } else {
+            Write-Status "  ⚠️ $path exists but no reports found yet" -Type Warning
+        }
+        $script:ChecksPassed++
+    } else {
+        Write-Status "  ⚠️ $path does not exist" -Type Warning
+        Write-Status "    Directory will be created on first report run" -Type Info
+    }
+}
+
+# Test 7: WSUS Data Freshness
+Write-Status "`nChecking WSUS data freshness..." -Type Info
+$freshnessQuery = @"
+SELECT 
+    COUNT(DISTINCT c.ComputerID) as TotalComputers,
+    COUNT(DISTINCT CASE WHEN cs.LastSyncTime >= DATEADD(day, -7, GETDATE()) THEN c.ComputerID END) as ReportedLast7Days,
+    MAX(cs.LastSyncTime) as MostRecentSync
+FROM dbo.tbComputerTarget c
+LEFT JOIN dbo.tbComputerTargetDetail cs ON c.ComputerID = cs.TargetID
+WHERE c.IsDeleted = 0
+"@
+
+$freshnessResult = Invoke-SqlQuery -Query $freshnessQuery -ServerInstance $SqlServer -DatabaseName $Database
+
+if ($freshnessResult) {
+    $totalComputers = $freshnessResult.TotalComputers
+    $reportedRecently = $freshnessResult.ReportedLast7Days
+    $percentReporting = if ($totalComputers -gt 0) { [math]::Round(($reportedRecently / $totalComputers) * 100, 1) } else { 0 }
+    $mostRecent = if ($freshnessResult.MostRecentSync) { $freshnessResult.MostRecentSync.ToString("yyyy-MM-dd HH:mm") } else { "Never" }
+    
+    Write-Status "  Total computers: $totalComputers" -Type Info
+    Write-Status "  Reported in last 7 days: $reportedRecently ($percentReporting%)" -Type Info
+    Write-Status "  Most recent sync: $mostRecent" -Type Info
+    
+    if ($percentReporting -ge 90) {
+        Write-Status "  ✓ Good reporting rate (>90%)" -Type Success
+        $script:ChecksPassed++
+    } elseif ($percentReporting -ge 75) {
+        Write-Status "  ⚠️ Moderate reporting rate (75-90%)" -Type Warning
+        Write-Status "    Investigate why some systems aren't reporting" -Type Info
+    } else {
+        Write-Status "  ✗ Low reporting rate (<75%)" -Type Error
+        Write-Status "    Check: WSUS server health, Group Policy, client connectivity" -Type Warning
+        $script:IssuesFound++
+    }
+} else {
+    Write-Status "  Failed to query WSUS data freshness" -Type Error
+    $script:IssuesFound++
+}
+
+# Test 8: Sample Report Data
+Write-Status "`nSample data from views..." -Type Info
+$sampleQueries = @{
+    "Overall Compliance" = "SELECT TOP 1 * FROM vw_OverallCompliance"
+    "Missing Critical Updates" = "SELECT COUNT(*) as Count FROM vw_MissingSecurityUpdates WHERE Severity = 'Critical'"
+    "Non-Reporting Systems" = "SELECT COUNT(*) as Count FROM vw_NonReportingSystems"
+}
+
+foreach ($queryName in $sampleQueries.Keys) {
+    $sampleData = Invoke-SqlQuery -Query $sampleQueries[$queryName] -ServerInstance $SqlServer -DatabaseName $Database
+    if ($sampleData) {
+        if ($queryName -eq "Overall Compliance") {
+            Write-Status "  $queryName - $($sampleData.CompliancePercentage)% compliant" -Type Success
+        } else {
+            Write-Status "  $queryName - $($sampleData.Count) records" -Type Success
+        }
+    } else {
+        Write-Status "  $queryName - No data" -Type Warning
+    }
+}
+
+# Summary
+Write-Host ""
+Write-Host "═══════════════════════════════════════════════════════════" -ForegroundColor White
+Write-Host "                     HEALTH CHECK SUMMARY" -ForegroundColor White
+Write-Host "═══════════════════════════════════════════════════════════" -ForegroundColor White
+Write-Host ""
+
+$totalChecks = $script:ChecksPassed + $script:IssuesFound
+Write-Host "Checks Passed: " -NoNewline
+Write-Host "$($script:ChecksPassed)/$totalChecks" -ForegroundColor Green
+
+if ($script:IssuesFound -gt 0) {
+    Write-Host "Issues Found: " -NoNewline
+    Write-Host "$($script:IssuesFound)" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "⚠️  Some issues were detected. Review the output above for details." -ForegroundColor Yellow
+    Write-Host "See DEPLOYMENT-GUIDE.md for troubleshooting help." -ForegroundColor Cyan
+} else {
+    Write-Host ""
+    Write-Host "✓ All checks passed! Your WSUS reporting solution is ready to use." -ForegroundColor Green
+    Write-Host ""
+    Write-Host "Next steps:" -ForegroundColor Cyan
+    Write-Host "  1. Run: .\Generate-WSUSReports.ps1 -SqlServer '$SqlServer' -OutputPath 'C:\WSUSReports'" -ForegroundColor White
+    Write-Host "  2. Open the generated HTML report in a browser" -ForegroundColor White
+    Write-Host "  3. Setup automation with Setup-AutomatedReporting.ps1" -ForegroundColor White
+}
+
+Write-Host ""

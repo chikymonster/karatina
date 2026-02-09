@@ -1,0 +1,326 @@
+<#
+.SYNOPSIS
+    WSUS Reporting Solution - Quick Install (Single Folder Version)
+    
+.DESCRIPTION
+    One-click installation script that:
+    1. Verifies prerequisites
+    2. Deploys SQL views
+    3. Tests connectivity
+    4. Generates first report
+    5. Optionally sets up automation
+    
+    ALL FILES IN SAME FOLDER - Easy to deploy!
+    
+.PARAMETER SqlServer
+    SQL Server instance hosting SUSDB (REQUIRED)
+    
+.PARAMETER SetupAutomation
+    Create scheduled tasks for automated reporting
+    
+.PARAMETER SmtpServer
+    SMTP server for email delivery (required if SetupAutomation is used)
+    
+.PARAMETER EmailTo
+    Recipient email addresses, comma-separated (required if SetupAutomation is used)
+    
+.PARAMETER EmailFrom
+    Sender email address (required if SetupAutomation is used)
+    
+.EXAMPLE
+    # Basic install (SQL views + test report)
+    .\Install-WSUSReporting.ps1 -SqlServer "WSUSSQL01"
+    
+.EXAMPLE
+    # Full install with automation
+    .\Install-WSUSReporting.ps1 -SqlServer "WSUSSQL01" -SetupAutomation `
+        -SmtpServer "smtp.company.com" `
+        -EmailTo "audit@company.com" `
+        -EmailFrom "wsus@company.com"
+    
+.NOTES
+    Must be run as Administrator
+    Requires SQL access to SUSDB
+    All files must be in the same folder
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$SqlServer,
+    
+    [Parameter(Mandatory=$false)]
+    [switch]$SetupAutomation,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$SmtpServer,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$EmailTo,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$EmailFrom
+)
+
+$ErrorActionPreference = "Stop"
+
+# Verify running as admin
+$currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+$isAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if (-not $isAdmin) {
+    Write-Error "This script must be run as Administrator. Right-click PowerShell and select 'Run as Administrator'."
+    exit 1
+}
+
+# Validate automation parameters
+if ($SetupAutomation) {
+    if (-not $SmtpServer -or -not $EmailTo -or -not $EmailFrom) {
+        Write-Error "When using -SetupAutomation, you must provide -SmtpServer, -EmailTo, and -EmailFrom"
+        exit 1
+    }
+}
+
+Write-Host ""
+Write-Host "╔══════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+Write-Host "║                                                          ║" -ForegroundColor Cyan
+Write-Host "║       WSUS REPORTING SOLUTION - QUICK INSTALL            ║" -ForegroundColor Cyan
+Write-Host "║              (Single Folder Edition)                     ║" -ForegroundColor Cyan
+Write-Host "║                                                          ║" -ForegroundColor Cyan
+Write-Host "╚══════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+Write-Host ""
+
+# Get script directory (everything is in same folder)
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$outputDir = "C:\WSUSReports"
+
+Write-Host "Installation Directory: $scriptDir" -ForegroundColor Gray
+Write-Host "SQL Server: $SqlServer" -ForegroundColor Gray
+Write-Host "Output Directory: $outputDir" -ForegroundColor Gray
+Write-Host ""
+
+# Step 1: Verify Prerequisites
+Write-Host "[1/5] Verifying prerequisites..." -ForegroundColor Cyan
+
+# Check for SQL connectivity
+Write-Host "  Testing SQL Server connection..." -ForegroundColor Gray
+try {
+    $connectionString = "Server=$SqlServer;Database=SUSDB;Integrated Security=True;TrustServerCertificate=True;Connection Timeout=5;"
+    $connection = New-Object System.Data.SqlClient.SqlConnection($connectionString)
+    $connection.Open()
+    $connection.Close()
+    Write-Host "  ✓ SQL Server connection successful" -ForegroundColor Green
+}
+catch {
+    Write-Host "  ✗ Failed to connect to SQL Server" -ForegroundColor Red
+    Write-Host "  Error: $_" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "Troubleshooting:" -ForegroundColor Yellow
+    Write-Host "  - Verify SQL Server name is correct" -ForegroundColor White
+    Write-Host "  - Check firewall allows port 1433" -ForegroundColor White
+    Write-Host "  - Ensure Windows Authentication is enabled" -ForegroundColor White
+    Write-Host "  - Confirm SUSDB database exists" -ForegroundColor White
+    exit 1
+}
+
+# Check for SQL view files
+Write-Host "  Checking for SQL view scripts..." -ForegroundColor Gray
+$sqlFiles = Get-ChildItem -Path $scriptDir -Filter "*_vw_*.sql" | Sort-Object Name
+
+if ($sqlFiles.Count -eq 0) {
+    Write-Host "  ✗ No SQL view scripts found in $scriptDir" -ForegroundColor Red
+    Write-Host "  Make sure all .sql files are in the same folder as this script" -ForegroundColor Yellow
+    exit 1
+}
+
+Write-Host "  ✓ Found $($sqlFiles.Count) SQL view scripts" -ForegroundColor Green
+
+# Check for PowerShell scripts
+Write-Host "  Checking for PowerShell scripts..." -ForegroundColor Gray
+$requiredScripts = @('Generate-WSUSReports.ps1', 'Test-WSUSReportingHealth.ps1')
+$missingScripts = @()
+
+foreach ($script in $requiredScripts) {
+    if (-not (Test-Path (Join-Path $scriptDir $script))) {
+        $missingScripts += $script
+    }
+}
+
+if ($missingScripts.Count -gt 0) {
+    Write-Host "  ✗ Missing required scripts: $($missingScripts -join ', ')" -ForegroundColor Red
+    Write-Host "  Make sure all files are in the same folder" -ForegroundColor Yellow
+    exit 1
+}
+
+Write-Host "  ✓ All required PowerShell scripts found" -ForegroundColor Green
+
+# Create output directory
+if (-not (Test-Path $outputDir)) {
+    New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+    Write-Host "  ✓ Created output directory: $outputDir" -ForegroundColor Green
+} else {
+    Write-Host "  ✓ Output directory exists: $outputDir" -ForegroundColor Green
+}
+
+Write-Host ""
+
+# Step 2: Deploy SQL Views
+Write-Host "[2/5] Deploying SQL views..." -ForegroundColor Cyan
+
+function Invoke-SqlScript {
+    param([string]$FilePath, [string]$ServerInstance)
+    
+    try {
+        $scriptContent = Get-Content -Path $FilePath -Raw
+        
+        $connectionString = "Server=$ServerInstance;Database=SUSDB;Integrated Security=True;TrustServerCertificate=True;"
+        $connection = New-Object System.Data.SqlClient.SqlConnection($connectionString)
+        $connection.Open()
+        
+        $command = $connection.CreateCommand()
+        $command.CommandText = $scriptContent
+        $command.CommandTimeout = 60
+        $command.ExecuteNonQuery() | Out-Null
+        
+        $connection.Close()
+        return $true
+    }
+    catch {
+        Write-Host "  Error: $_" -ForegroundColor Red
+        return $false
+    }
+}
+
+$viewsDeployed = 0
+foreach ($sqlFile in $sqlFiles) {
+    Write-Host "  Deploying $($sqlFile.Name)..." -ForegroundColor Gray
+    if (Invoke-SqlScript -FilePath $sqlFile.FullName -ServerInstance $SqlServer) {
+        Write-Host "    ✓ Success" -ForegroundColor Green
+        $viewsDeployed++
+    } else {
+        Write-Host "    ✗ Failed" -ForegroundColor Red
+    }
+}
+
+if ($viewsDeployed -eq $sqlFiles.Count) {
+    Write-Host "  ✓ All $viewsDeployed SQL views deployed successfully" -ForegroundColor Green
+} else {
+    Write-Host "  ⚠️  Only $viewsDeployed of $($sqlFiles.Count) views deployed" -ForegroundColor Yellow
+}
+
+Write-Host ""
+
+# Step 3: Health Check
+Write-Host "[3/5] Running health check..." -ForegroundColor Cyan
+$healthCheckScript = Join-Path $scriptDir "Test-WSUSReportingHealth.ps1"
+
+if (Test-Path $healthCheckScript) {
+    & $healthCheckScript -SqlServer $SqlServer
+} else {
+    Write-Host "  ⚠️  Health check script not found, skipping..." -ForegroundColor Yellow
+}
+
+Write-Host ""
+
+# Step 4: Generate First Report
+Write-Host "[4/5] Generating your first report..." -ForegroundColor Cyan
+$reportScript = Join-Path $scriptDir "Generate-WSUSReports.ps1"
+
+if (Test-Path $reportScript) {
+    Write-Host "  Running report generator..." -ForegroundColor Gray
+    try {
+        & $reportScript -SqlServer $SqlServer -OutputPath $outputDir
+        
+        # Find the generated report
+        $latestReport = Get-ChildItem -Path $outputDir -Filter "WSUS_Report_*.html" | 
+                       Sort-Object LastWriteTime -Descending | 
+                       Select-Object -First 1
+        
+        if ($latestReport) {
+            Write-Host "  ✓ Report generated successfully!" -ForegroundColor Green
+            Write-Host "    Location: $($latestReport.FullName)" -ForegroundColor Cyan
+            Write-Host ""
+            Write-Host "  Opening report in default browser..." -ForegroundColor Gray
+            Start-Process $latestReport.FullName
+        } else {
+            Write-Host "  ⚠️  Report file not found" -ForegroundColor Yellow
+        }
+    }
+    catch {
+        Write-Host "  ✗ Failed to generate report" -ForegroundColor Red
+        Write-Host "  Error: $_" -ForegroundColor Red
+    }
+} else {
+    Write-Host "  ⚠️  Report generator script not found" -ForegroundColor Yellow
+}
+
+Write-Host ""
+
+# Step 5: Setup Automation (Optional)
+if ($SetupAutomation) {
+    Write-Host "[5/5] Setting up automated reporting..." -ForegroundColor Cyan
+    $setupScript = Join-Path $scriptDir "Setup-AutomatedReporting.ps1"
+    
+    if (Test-Path $setupScript) {
+        Write-Host "  Creating scheduled tasks..." -ForegroundColor Gray
+        try {
+            & $setupScript -SqlServer $SqlServer `
+                          -ReportPath $outputDir `
+                          -SmtpServer $SmtpServer `
+                          -EmailTo $EmailTo `
+                          -EmailFrom $EmailFrom `
+                          -ScheduleDay "Monday" `
+                          -ScheduleTime "08:00"
+            
+            Write-Host "  ✓ Automation configured successfully" -ForegroundColor Green
+        }
+        catch {
+            Write-Host "  ✗ Failed to setup automation" -ForegroundColor Red
+            Write-Host "  Error: $_" -ForegroundColor Red
+        }
+    } else {
+        Write-Host "  ⚠️  Setup automation script not found" -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "[5/5] Skipping automation setup" -ForegroundColor Yellow
+    Write-Host "  To setup automation later, run:" -ForegroundColor Gray
+    Write-Host "  .\Setup-AutomatedReporting.ps1 -SqlServer '$SqlServer' -SmtpServer '<smtp>' -EmailTo '<email>' -EmailFrom '<from>'" -ForegroundColor White
+}
+
+Write-Host ""
+Write-Host "╔══════════════════════════════════════════════════════════╗" -ForegroundColor Green
+Write-Host "║                                                          ║" -ForegroundColor Green
+Write-Host "║            INSTALLATION COMPLETE!                        ║" -ForegroundColor Green
+Write-Host "║                                                          ║" -ForegroundColor Green
+Write-Host "╚══════════════════════════════════════════════════════════╝" -ForegroundColor Green
+Write-Host ""
+
+Write-Host "What's been installed:" -ForegroundColor Cyan
+Write-Host "  ✓ SQL views for efficient data extraction" -ForegroundColor White
+Write-Host "  ✓ PowerShell reporting scripts" -ForegroundColor White
+Write-Host "  ✓ HTML report with charts and dashboards" -ForegroundColor White
+if ($SetupAutomation) {
+    Write-Host "  ✓ Scheduled tasks for automated reporting" -ForegroundColor White
+}
+
+Write-Host ""
+Write-Host "Your first report is ready! Check your browser." -ForegroundColor Green
+Write-Host ""
+
+Write-Host "All scripts are in: $scriptDir" -ForegroundColor Cyan
+Write-Host "Reports saved to: $outputDir" -ForegroundColor Cyan
+Write-Host ""
+
+Write-Host "Quick Commands (run from $scriptDir):" -ForegroundColor Yellow
+Write-Host "  Generate report:  .\Generate-WSUSReports.ps1 -SqlServer '$SqlServer' -OutputPath '$outputDir'" -ForegroundColor White
+Write-Host "  Export CSV:       .\Export-WSUSDataToCSV.ps1 -SqlServer '$SqlServer' -OutputPath '$outputDir\CSV'" -ForegroundColor White
+Write-Host "  Health check:     .\Test-WSUSReportingHealth.ps1 -SqlServer '$SqlServer'" -ForegroundColor White
+
+if (-not $SetupAutomation) {
+    Write-Host ""
+    Write-Host "  Setup automation: .\Setup-AutomatedReporting.ps1 -SqlServer '$SqlServer' -SmtpServer '<smtp>' -EmailTo '<email>' -EmailFrom '<from>'" -ForegroundColor White
+}
+
+Write-Host ""
+Write-Host "🎉 Enjoy your new WSUS reporting system!" -ForegroundColor Green
+Write-Host ""

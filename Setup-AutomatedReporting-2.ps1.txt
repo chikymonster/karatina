@@ -1,0 +1,216 @@
+<#
+.SYNOPSIS
+    Setup Automated WSUS Reporting
+    
+.DESCRIPTION
+    Creates scheduled tasks to automatically generate WSUS reports weekly and email them to stakeholders.
+    
+.PARAMETER SqlServer
+    SQL Server instance hosting SUSDB
+    
+.PARAMETER ReportPath
+    Path where reports will be saved
+    
+.PARAMETER SmtpServer
+    SMTP server for email delivery
+    
+.PARAMETER EmailTo
+    Recipient email addresses (comma-separated)
+    
+.PARAMETER EmailFrom
+    Sender email address
+    
+.PARAMETER ScheduleDay
+    Day of week to run report (Monday, Tuesday, etc.)
+    
+.PARAMETER ScheduleTime
+    Time to run report (24-hour format, e.g., "08:00")
+    
+.EXAMPLE
+    .\Setup-AutomatedReporting.ps1 -SqlServer "WSUSSQL01" -SmtpServer "smtp.company.com" -EmailTo "audit@company.com,security@company.com" -EmailFrom "wsus@company.com" -ScheduleDay "Monday" -ScheduleTime "08:00"
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$SqlServer,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$ReportPath = "C:\WSUSReports",
+    
+    [Parameter(Mandatory=$true)]
+    [string]$SmtpServer,
+    
+    [Parameter(Mandatory=$true)]
+    [string]$EmailTo,
+    
+    [Parameter(Mandatory=$true)]
+    [string]$EmailFrom,
+    
+    [Parameter(Mandatory=$false)]
+    [ValidateSet('Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday')]
+    [string]$ScheduleDay = "Monday",
+    
+    [Parameter(Mandatory=$false)]
+    [string]$ScheduleTime = "08:00"
+)
+
+# Verify we're running as administrator
+$currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+$isAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if (-not $isAdmin) {
+    Write-Error "This script must be run as Administrator to create scheduled tasks."
+    exit 1
+}
+
+Write-Host "Setting up automated WSUS reporting..." -ForegroundColor Cyan
+
+# Get the directory where this script is located
+$scriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
+$mainReportScript = Join-Path $scriptDirectory "Generate-WSUSReports.ps1"
+
+# Verify the main report script exists
+if (-not (Test-Path $mainReportScript)) {
+    Write-Error "Main report script not found at: $mainReportScript"
+    Write-Host "Please ensure Generate-WSUSReports.ps1 is in the same directory as this script." -ForegroundColor Yellow
+    exit 1
+}
+
+# Create report directory if it doesn't exist
+if (-not (Test-Path $ReportPath)) {
+    New-Item -ItemType Directory -Path $ReportPath -Force | Out-Null
+    Write-Host "Created report directory: $ReportPath" -ForegroundColor Green
+}
+
+# Create the PowerShell command for the scheduled task
+$psCommand = @"
+-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "$mainReportScript" -SqlServer "$SqlServer" -OutputPath "$ReportPath" -EmailReport -SmtpServer "$SmtpServer" -EmailTo "$EmailTo" -EmailFrom "$EmailFrom"
+"@
+
+# Create scheduled task for weekly HTML report
+Write-Host "`nCreating scheduled task: WSUS-WeeklyReport" -ForegroundColor Gray
+
+$taskName = "WSUS-WeeklyReport"
+$taskDescription = "Generates weekly WSUS compliance reports and emails them to stakeholders"
+
+# Check if task already exists and remove it
+$existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+if ($existingTask) {
+    Write-Host "  Removing existing task..." -ForegroundColor Yellow
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+}
+
+# Create the action
+$action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument $psCommand
+
+# Create the trigger (weekly on specified day and time)
+$trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $ScheduleDay -At $ScheduleTime
+
+# Create the principal (run as SYSTEM with highest privileges)
+$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+
+# Create settings
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RunOnlyIfNetworkAvailable
+
+# Register the task
+Register-ScheduledTask -TaskName $taskName `
+                      -Description $taskDescription `
+                      -Action $action `
+                      -Trigger $trigger `
+                      -Principal $principal `
+                      -Settings $settings | Out-Null
+
+Write-Host "  ✓ Task created successfully" -ForegroundColor Green
+Write-Host "    Schedule: Every $ScheduleDay at $ScheduleTime" -ForegroundColor Cyan
+
+# Create a daily summary task (runs at 6 AM daily, no email)
+Write-Host "`nCreating scheduled task: WSUS-DailySummary" -ForegroundColor Gray
+
+$taskName2 = "WSUS-DailySummary"
+$taskDescription2 = "Generates daily WSUS compliance reports (no email)"
+
+# Check if task already exists and remove it
+$existingTask2 = Get-ScheduledTask -TaskName $taskName2 -ErrorAction SilentlyContinue
+if ($existingTask2) {
+    Write-Host "  Removing existing task..." -ForegroundColor Yellow
+    Unregister-ScheduledTask -TaskName $taskName2 -Confirm:$false
+}
+
+# Command without email
+$psCommand2 = @"
+-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "$mainReportScript" -SqlServer "$SqlServer" -OutputPath "$ReportPath"
+"@
+
+$action2 = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument $psCommand2
+$trigger2 = New-ScheduledTaskTrigger -Daily -At "06:00"
+
+Register-ScheduledTask -TaskName $taskName2 `
+                      -Description $taskDescription2 `
+                      -Action $action2 `
+                      -Trigger $trigger2 `
+                      -Principal $principal `
+                      -Settings $settings | Out-Null
+
+Write-Host "  ✓ Task created successfully" -ForegroundColor Green
+Write-Host "    Schedule: Daily at 06:00" -ForegroundColor Cyan
+
+# Create cleanup task (removes reports older than 90 days)
+Write-Host "`nCreating scheduled task: WSUS-ReportCleanup" -ForegroundColor Gray
+
+$taskName3 = "WSUS-ReportCleanup"
+$taskDescription3 = "Removes WSUS reports older than 90 days"
+
+# Check if task already exists and remove it
+$existingTask3 = Get-ScheduledTask -TaskName $taskName3 -ErrorAction SilentlyContinue
+if ($existingTask3) {
+    Write-Host "  Removing existing task..." -ForegroundColor Yellow
+    Unregister-ScheduledTask -TaskName $taskName3 -Confirm:$false
+}
+
+# Cleanup script command
+$cleanupCommand = @"
+-NoProfile -WindowStyle Hidden -Command "Get-ChildItem -Path '$ReportPath' -Recurse -File | Where-Object { `$_.CreationTime -lt (Get-Date).AddDays(-90) } | Remove-Item -Force"
+"@
+
+$action3 = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument $cleanupCommand
+$trigger3 = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At "02:00"
+
+Register-ScheduledTask -TaskName $taskName3 `
+                      -Description $taskDescription3 `
+                      -Action $action3 `
+                      -Trigger $trigger3 `
+                      -Principal $principal `
+                      -Settings $settings | Out-Null
+
+Write-Host "  ✓ Task created successfully" -ForegroundColor Green
+Write-Host "    Schedule: Weekly on Sunday at 02:00" -ForegroundColor Cyan
+
+# Summary
+Write-Host "`n" + ("="*70) -ForegroundColor White
+Write-Host "AUTOMATED REPORTING SETUP COMPLETE" -ForegroundColor Green
+Write-Host ("="*70) -ForegroundColor White
+
+Write-Host "`nScheduled Tasks Created:" -ForegroundColor Cyan
+Write-Host "  1. WSUS-WeeklyReport" -ForegroundColor White
+Write-Host "     - Runs: Every $ScheduleDay at $ScheduleTime" -ForegroundColor Gray
+Write-Host "     - Sends email to: $EmailTo" -ForegroundColor Gray
+Write-Host ""
+Write-Host "  2. WSUS-DailySummary" -ForegroundColor White
+Write-Host "     - Runs: Daily at 06:00" -ForegroundColor Gray
+Write-Host "     - No email (local reports only)" -ForegroundColor Gray
+Write-Host ""
+Write-Host "  3. WSUS-ReportCleanup" -ForegroundColor White
+Write-Host "     - Runs: Weekly on Sunday at 02:00" -ForegroundColor Gray
+Write-Host "     - Removes reports older than 90 days" -ForegroundColor Gray
+
+Write-Host "`nReport Location: $ReportPath" -ForegroundColor Cyan
+Write-Host "SQL Server: $SqlServer" -ForegroundColor Cyan
+
+Write-Host "`nTo test the report now, run:" -ForegroundColor Yellow
+Write-Host "  Start-ScheduledTask -TaskName 'WSUS-WeeklyReport'" -ForegroundColor White
+
+Write-Host "`nTo view scheduled tasks:" -ForegroundColor Yellow
+Write-Host "  Get-ScheduledTask | Where-Object {`$_.TaskName -like 'WSUS-*'}" -ForegroundColor White
+
+Write-Host "`n✓ Setup complete!" -ForegroundColor Green
