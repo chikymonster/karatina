@@ -1,0 +1,825 @@
+<#
+.SYNOPSIS
+    WSUS Reporting Dashboard Generator
+    
+.DESCRIPTION
+    Generates comprehensive, auditor-friendly WSUS reports with charts and dashboards.
+    Pulls data from SUSDB SQL database and creates HTML reports with embedded charts.
+    
+.PARAMETER SqlServer
+    SQL Server instance hosting SUSDB
+    
+.PARAMETER Database
+    Database name (default: SUSDB)
+    
+.PARAMETER OutputPath
+    Path for output reports (default: C:\WSUSReports)
+    
+.PARAMETER EmailReport
+    Switch to email the report
+    
+.PARAMETER SmtpServer
+    SMTP server for email delivery
+    
+.PARAMETER EmailTo
+    Recipient email addresses (comma-separated)
+    
+.PARAMETER EmailFrom
+    Sender email address
+    
+.EXAMPLE
+    .\Generate-WSUSReports.ps1 -SqlServer "WSUSSQL01" -OutputPath "C:\Reports"
+    
+.EXAMPLE
+    .\Generate-WSUSReports.ps1 -SqlServer "WSUSSQL01" -EmailReport -SmtpServer "smtp.company.com" -EmailTo "audit@company.com" -EmailFrom "wsus@company.com"
+    
+.NOTES
+    Author: WSUS Admin
+    Version: 1.0
+    Requires: SQL Server PowerShell module or .NET SQL client
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$SqlServer,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$Database = "SUSDB",
+    
+    [Parameter(Mandatory=$false)]
+    [string]$OutputPath = "C:\WSUSReports",
+    
+    [Parameter(Mandatory=$false)]
+    [switch]$EmailReport,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$SmtpServer,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$EmailTo,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$EmailFrom,
+    
+    [Parameter(Mandatory=$false)]
+    [switch]$UseWindowsAuth = $true
+)
+
+# Create output directory if it doesn't exist
+if (-not (Test-Path $OutputPath)) {
+    New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
+}
+
+$ReportDate = Get-Date -Format "yyyy-MM-dd"
+$ReportDateTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+$HtmlReportPath = Join-Path $OutputPath "WSUS_Report_$ReportDate.html"
+
+#region SQL Functions
+
+function Invoke-SqlQuery {
+    param(
+        [string]$Query,
+        [string]$ServerInstance,
+        [string]$DatabaseName
+    )
+    
+    try {
+        $connectionString = "Server=$ServerInstance;Database=$DatabaseName;Integrated Security=True;TrustServerCertificate=True;"
+        $connection = New-Object System.Data.SqlClient.SqlConnection($connectionString)
+        $connection.Open()
+        
+        $command = $connection.CreateCommand()
+        $command.CommandText = $Query
+        $command.CommandTimeout = 300
+        
+        $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($command)
+        $dataset = New-Object System.Data.DataSet
+        $adapter.Fill($dataset) | Out-Null
+        
+        $connection.Close()
+        
+        return $dataset.Tables[0]
+    }
+    catch {
+        Write-Error "SQL Query failed: $_"
+        return $null
+    }
+}
+
+#endregion
+
+#region Data Collection
+
+Write-Host "Collecting WSUS data from $SqlServer..." -ForegroundColor Cyan
+
+# Overall Compliance
+Write-Host "  - Overall compliance statistics..." -ForegroundColor Gray
+$overallCompliance = Invoke-SqlQuery -Query "SELECT * FROM vw_OverallCompliance" -ServerInstance $SqlServer -DatabaseName $Database
+
+# Compliance by Classification
+Write-Host "  - Compliance by classification..." -ForegroundColor Gray
+$complianceByClass = Invoke-SqlQuery -Query "SELECT * FROM vw_ComplianceByClassification ORDER BY Classification" -ServerInstance $SqlServer -DatabaseName $Database
+
+# Missing Security Updates
+Write-Host "  - Missing security updates..." -ForegroundColor Gray
+$missingUpdates = Invoke-SqlQuery -Query "SELECT TOP 20 * FROM vw_MissingSecurityUpdates ORDER BY DaysSinceRelease DESC, ComputersAffected DESC" -ServerInstance $SqlServer -DatabaseName $Database
+
+# Non-Reporting Systems
+Write-Host "  - Non-reporting systems..." -ForegroundColor Gray
+$nonReporting = Invoke-SqlQuery -Query "SELECT * FROM vw_NonReportingSystems ORDER BY DaysSinceLastSync DESC" -ServerInstance $SqlServer -DatabaseName $Database
+
+# System Type Compliance
+Write-Host "  - Server vs workstation compliance..." -ForegroundColor Gray
+$systemTypeCompliance = Invoke-SqlQuery -Query "SELECT * FROM vw_ComplianceBySystemType ORDER BY SystemType" -ServerInstance $SqlServer -DatabaseName $Database
+
+# Top Non-Compliant Systems
+Write-Host "  - Top non-compliant systems..." -ForegroundColor Gray
+$topNonCompliant = Invoke-SqlQuery -Query "SELECT TOP 10 * FROM vw_TopNonCompliantSystems" -ServerInstance $SqlServer -DatabaseName $Database
+
+Write-Host "Data collection complete!" -ForegroundColor Green
+
+#endregion
+
+#region HTML Generation
+
+Write-Host "Generating HTML report..." -ForegroundColor Cyan
+
+# Calculate key metrics
+$totalComputers = if ($overallCompliance) { $overallCompliance.TotalComputers } else { 0 }
+$compliancePercent = if ($overallCompliance) { $overallCompliance.CompliancePercentage } else { 0 }
+$reportingPercent = if ($totalComputers -gt 0) { [math]::Round(($overallCompliance.ReportingLast30Days / $totalComputers) * 100, 2) } else { 0 }
+$nonReportingCount = if ($overallCompliance) { $overallCompliance.NotReportingLast30Days } else { 0 }
+
+# Determine health status color
+$healthColor = if ($compliancePercent -ge 95) { "#28a745" } elseif ($compliancePercent -ge 85) { "#ffc107" } else { "#dc3545" }
+
+$htmlContent = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WSUS Compliance Report - $ReportDate</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #f5f7fa;
+            padding: 20px;
+            color: #333;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        
+        .header p {
+            font-size: 1.1em;
+            opacity: 0.9;
+        }
+        
+        .dashboard {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            padding: 30px;
+            background: #f8f9fa;
+        }
+        
+        .metric-card {
+            background: white;
+            padding: 25px;
+            border-radius: 8px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            border-left: 4px solid #667eea;
+        }
+        
+        .metric-card.success {
+            border-left-color: #28a745;
+        }
+        
+        .metric-card.warning {
+            border-left-color: #ffc107;
+        }
+        
+        .metric-card.danger {
+            border-left-color: #dc3545;
+        }
+        
+        .metric-value {
+            font-size: 2.5em;
+            font-weight: bold;
+            color: #667eea;
+        }
+        
+        .metric-card.success .metric-value {
+            color: #28a745;
+        }
+        
+        .metric-card.warning .metric-value {
+            color: #ffc107;
+        }
+        
+        .metric-card.danger .metric-value {
+            color: #dc3545;
+        }
+        
+        .metric-label {
+            font-size: 0.9em;
+            color: #666;
+            margin-top: 5px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        .section {
+            padding: 30px;
+            border-bottom: 1px solid #e0e0e0;
+        }
+        
+        .section:last-child {
+            border-bottom: none;
+        }
+        
+        .section-title {
+            font-size: 1.8em;
+            margin-bottom: 20px;
+            color: #333;
+            border-bottom: 3px solid #667eea;
+            padding-bottom: 10px;
+        }
+        
+        .chart-container {
+            position: relative;
+            height: 400px;
+            margin: 20px 0;
+        }
+        
+        .chart-row {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 30px;
+            margin: 20px 0;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+            font-size: 0.95em;
+        }
+        
+        th {
+            background: #667eea;
+            color: white;
+            padding: 12px;
+            text-align: left;
+            font-weight: 600;
+            position: sticky;
+            top: 0;
+        }
+        
+        td {
+            padding: 12px;
+            border-bottom: 1px solid #e0e0e0;
+        }
+        
+        tr:hover {
+            background: #f8f9fa;
+        }
+        
+        .badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 0.85em;
+            font-weight: 600;
+        }
+        
+        .badge-critical {
+            background: #dc3545;
+            color: white;
+        }
+        
+        .badge-high {
+            background: #fd7e14;
+            color: white;
+        }
+        
+        .badge-medium {
+            background: #ffc107;
+            color: #333;
+        }
+        
+        .badge-low {
+            background: #28a745;
+            color: white;
+        }
+        
+        .footer {
+            background: #333;
+            color: white;
+            padding: 20px;
+            text-align: center;
+            font-size: 0.9em;
+        }
+        
+        .health-indicator {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            margin-right: 8px;
+            vertical-align: middle;
+        }
+        
+        @media print {
+            .container {
+                box-shadow: none;
+            }
+            
+            .section {
+                page-break-inside: avoid;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🛡️ WSUS Compliance Dashboard</h1>
+            <p>Generated: $ReportDateTime</p>
+            <p>Server: $SqlServer</p>
+        </div>
+        
+        <div class="dashboard">
+            <div class="metric-card $(if ($compliancePercent -ge 95) { 'success' } elseif ($compliancePercent -ge 85) { 'warning' } else { 'danger' })">
+                <div class="metric-value">$($compliancePercent)%</div>
+                <div class="metric-label">Overall Compliance</div>
+            </div>
+            
+            <div class="metric-card">
+                <div class="metric-value">$totalComputers</div>
+                <div class="metric-label">Total Systems</div>
+            </div>
+            
+            <div class="metric-card $(if ($reportingPercent -ge 90) { 'success' } elseif ($reportingPercent -ge 75) { 'warning' } else { 'danger' })">
+                <div class="metric-value">$($reportingPercent)%</div>
+                <div class="metric-label">Reporting (30 Days)</div>
+            </div>
+            
+            <div class="metric-card $(if ($nonReportingCount -eq 0) { 'success' } elseif ($nonReportingCount -lt 10) { 'warning' } else { 'danger' })">
+                <div class="metric-value">$nonReportingCount</div>
+                <div class="metric-label">Non-Reporting Systems</div>
+            </div>
+        </div>
+"@
+
+# Add System Type Compliance Chart
+if ($systemTypeCompliance -and $systemTypeCompliance.Rows.Count -gt 0) {
+    $htmlContent += @"
+        <div class="section">
+            <h2 class="section-title">Server vs Workstation Compliance</h2>
+            <div class="chart-row">
+                <div class="chart-container">
+                    <canvas id="systemTypeChart"></canvas>
+                </div>
+            </div>
+            
+            <table>
+                <thead>
+                    <tr>
+                        <th>System Type</th>
+                        <th>Total Systems</th>
+                        <th>Compliant</th>
+                        <th>Need Updates</th>
+                        <th>Compliance %</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+"@
+    
+    foreach ($row in $systemTypeCompliance.Rows) {
+        $statusClass = if ($row.CompliancePercentage -ge 95) { 'badge-low' } elseif ($row.CompliancePercentage -ge 85) { 'badge-medium' } else { 'badge-critical' }
+        $htmlContent += @"
+                    <tr>
+                        <td><strong>$($row.SystemType)</strong></td>
+                        <td>$($row.TotalSystems)</td>
+                        <td>$($row.CompliantSystems)</td>
+                        <td>$($row.SystemsNeedingUpdates)</td>
+                        <td><strong>$($row.CompliancePercentage)%</strong></td>
+                        <td><span class="badge $statusClass">$(if ($row.CompliancePercentage -ge 95) { 'Excellent' } elseif ($row.CompliancePercentage -ge 85) { 'Good' } else { 'Needs Attention' })</span></td>
+                    </tr>
+"@
+    }
+    
+    $htmlContent += @"
+                </tbody>
+            </table>
+        </div>
+"@
+}
+
+# Add Compliance by Classification Chart
+if ($complianceByClass -and $complianceByClass.Rows.Count -gt 0) {
+    $htmlContent += @"
+        <div class="section">
+            <h2 class="section-title">Compliance by Update Classification</h2>
+            <div class="chart-row">
+                <div class="chart-container">
+                    <canvas id="classificationChart"></canvas>
+                </div>
+            </div>
+            
+            <table>
+                <thead>
+                    <tr>
+                        <th>Classification</th>
+                        <th>Computers</th>
+                        <th>Compliant</th>
+                        <th>Need Updates</th>
+                        <th>Updates Needed</th>
+                        <th>Compliance %</th>
+                    </tr>
+                </thead>
+                <tbody>
+"@
+    
+    foreach ($row in $complianceByClass.Rows) {
+        $htmlContent += @"
+                    <tr>
+                        <td><strong>$($row.Classification)</strong></td>
+                        <td>$($row.TotalComputers)</td>
+                        <td>$($row.ComputersCompliant)</td>
+                        <td>$($row.ComputersNeedingUpdates)</td>
+                        <td>$($row.UpdatesNeeded)</td>
+                        <td><strong>$($row.CompliancePercentage)%</strong></td>
+                    </tr>
+"@
+    }
+    
+    $htmlContent += @"
+                </tbody>
+            </table>
+        </div>
+"@
+}
+
+# Add Missing Security Updates
+if ($missingUpdates -and $missingUpdates.Rows.Count -gt 0) {
+    $htmlContent += @"
+        <div class="section">
+            <h2 class="section-title">🚨 Critical & Security Updates Missing</h2>
+            <p style="margin-bottom: 20px; color: #666;">These updates are approved but not yet installed on the indicated number of systems.</p>
+            
+            <table>
+                <thead>
+                    <tr>
+                        <th>Update Title</th>
+                        <th>Classification</th>
+                        <th>KB Article</th>
+                        <th>Computers Affected</th>
+                        <th>Days Old</th>
+                        <th>Severity</th>
+                    </tr>
+                </thead>
+                <tbody>
+"@
+    
+    foreach ($row in $missingUpdates.Rows) {
+        $severityClass = switch ($row.Severity) {
+            'Critical' { 'badge-critical' }
+            'High' { 'badge-high' }
+            'Medium' { 'badge-medium' }
+            default { 'badge-low' }
+        }
+        
+        $htmlContent += @"
+                    <tr>
+                        <td>$($row.UpdateTitle)</td>
+                        <td>$($row.Classification)</td>
+                        <td>$($row.KBArticle)</td>
+                        <td><strong>$($row.ComputersAffected)</strong></td>
+                        <td>$($row.DaysSinceRelease)</td>
+                        <td><span class="badge $severityClass">$($row.Severity)</span></td>
+                    </tr>
+"@
+    }
+    
+    $htmlContent += @"
+                </tbody>
+            </table>
+        </div>
+"@
+}
+
+# Add Top Non-Compliant Systems
+if ($topNonCompliant -and $topNonCompliant.Rows.Count -gt 0) {
+    $htmlContent += @"
+        <div class="section">
+            <h2 class="section-title">⚠️ Top 10 Non-Compliant Systems</h2>
+            <p style="margin-bottom: 20px; color: #666;">Systems with the highest number of missing updates (ordered by risk score).</p>
+            
+            <table>
+                <thead>
+                    <tr>
+                        <th>Computer Name</th>
+                        <th>Operating System</th>
+                        <th>Missing Critical</th>
+                        <th>Missing Security</th>
+                        <th>Total Missing</th>
+                        <th>Failed Updates</th>
+                        <th>Last Sync</th>
+                        <th>Risk Score</th>
+                    </tr>
+                </thead>
+                <tbody>
+"@
+    
+    foreach ($row in $topNonCompliant.Rows) {
+        $lastSync = if ($row.LastSyncTime) { 
+            (Get-Date $row.LastSyncTime -Format "yyyy-MM-dd") 
+        } else { 
+            "Never" 
+        }
+        
+        $riskClass = if ($row.RiskScore -ge 100) { 'badge-critical' } elseif ($row.RiskScore -ge 50) { 'badge-high' } else { 'badge-medium' }
+        
+        $htmlContent += @"
+                    <tr>
+                        <td><strong>$($row.ComputerName)</strong></td>
+                        <td>$($row.OperatingSystem)</td>
+                        <td style="color: #dc3545; font-weight: bold;">$($row.MissingCritical)</td>
+                        <td style="color: #fd7e14; font-weight: bold;">$($row.MissingSecurity)</td>
+                        <td><strong>$($row.TotalMissingUpdates)</strong></td>
+                        <td>$($row.FailedUpdates)</td>
+                        <td>$lastSync</td>
+                        <td><span class="badge $riskClass">$($row.RiskScore)</span></td>
+                    </tr>
+"@
+    }
+    
+    $htmlContent += @"
+                </tbody>
+            </table>
+        </div>
+"@
+}
+
+# Add Non-Reporting Systems
+if ($nonReporting -and $nonReporting.Rows.Count -gt 0) {
+    $htmlContent += @"
+        <div class="section">
+            <h2 class="section-title">📵 Non-Reporting Systems</h2>
+            <p style="margin-bottom: 20px; color: #666;">Systems that haven't checked in within the last 30 days.</p>
+            
+            <table>
+                <thead>
+                    <tr>
+                        <th>Computer Name</th>
+                        <th>Operating System</th>
+                        <th>Last Sync Time</th>
+                        <th>Days Since Last Sync</th>
+                        <th>IP Address</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+"@
+    
+    foreach ($row in $nonReporting.Rows | Select-Object -First 50) {
+        $lastSync = if ($row.LastSyncTime) { 
+            (Get-Date $row.LastSyncTime -Format "yyyy-MM-dd HH:mm") 
+        } else { 
+            "Never" 
+        }
+        
+        $statusClass = switch ($row.Status) {
+            'Critical (90+ days)' { 'badge-critical' }
+            'High (60-89 days)' { 'badge-high' }
+            'Medium (30-59 days)' { 'badge-medium' }
+            default { 'badge-low' }
+        }
+        
+        $htmlContent += @"
+                    <tr>
+                        <td><strong>$($row.ComputerName)</strong></td>
+                        <td>$($row.OperatingSystem)</td>
+                        <td>$lastSync</td>
+                        <td>$($row.DaysSinceLastSync)</td>
+                        <td>$($row.IPAddress)</td>
+                        <td><span class="badge $statusClass">$($row.Status)</span></td>
+                    </tr>
+"@
+    }
+    
+    $htmlContent += @"
+                </tbody>
+            </table>
+        </div>
+"@
+}
+
+# Add JavaScript for charts
+$htmlContent += @"
+        <div class="footer">
+            <p>WSUS Compliance Report | Generated by PowerShell Reporting Tool</p>
+            <p>For questions or issues, contact your IT Security Team</p>
+        </div>
+    </div>
+    
+    <script>
+        // Chart.js configuration
+        Chart.defaults.font.family = 'Segoe UI';
+        
+        // System Type Compliance Chart
+"@
+
+if ($systemTypeCompliance -and $systemTypeCompliance.Rows.Count -gt 0) {
+    $systemLabels = ($systemTypeCompliance.Rows | ForEach-Object { "'$($_.SystemType)'" }) -join ","
+    $compliantData = ($systemTypeCompliance.Rows | ForEach-Object { $_.CompliantSystems }) -join ","
+    $needingData = ($systemTypeCompliance.Rows | ForEach-Object { $_.SystemsNeedingUpdates }) -join ","
+    
+    $htmlContent += @"
+        const systemTypeCtx = document.getElementById('systemTypeChart').getContext('2d');
+        new Chart(systemTypeCtx, {
+            type: 'bar',
+            data: {
+                labels: [$systemLabels],
+                datasets: [{
+                    label: 'Compliant',
+                    data: [$compliantData],
+                    backgroundColor: '#28a745'
+                }, {
+                    label: 'Need Updates',
+                    data: [$needingData],
+                    backgroundColor: '#dc3545'
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    title: {
+                        display: true,
+                        text: 'Compliance Status by System Type'
+                    },
+                    legend: {
+                        position: 'top'
+                    }
+                },
+                scales: {
+                    x: {
+                        stacked: true
+                    },
+                    y: {
+                        stacked: true,
+                        beginAtZero: true
+                    }
+                }
+            }
+        });
+"@
+}
+
+if ($complianceByClass -and $complianceByClass.Rows.Count -gt 0) {
+    $classLabels = ($complianceByClass.Rows | ForEach-Object { "'$($_.Classification)'" }) -join ","
+    $classCompliance = ($complianceByClass.Rows | ForEach-Object { $_.CompliancePercentage }) -join ","
+    
+    $htmlContent += @"
+        
+        const classificationCtx = document.getElementById('classificationChart').getContext('2d');
+        new Chart(classificationCtx, {
+            type: 'bar',
+            data: {
+                labels: [$classLabels],
+                datasets: [{
+                    label: 'Compliance %',
+                    data: [$classCompliance],
+                    backgroundColor: [
+                        '#667eea',
+                        '#764ba2',
+                        '#f093fb',
+                        '#4facfe',
+                        '#43e97b',
+                        '#fa709a'
+                    ]
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    title: {
+                        display: true,
+                        text: 'Compliance Percentage by Update Type'
+                    },
+                    legend: {
+                        display: false
+                    }
+                },
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        max: 100,
+                        ticks: {
+                            callback: function(value) {
+                                return value + '%';
+                            }
+                        }
+                    }
+                }
+            }
+        });
+"@
+}
+
+$htmlContent += @"
+    </script>
+</body>
+</html>
+"@
+
+# Save HTML report
+$htmlContent | Out-File -FilePath $HtmlReportPath -Encoding UTF8
+Write-Host "HTML report saved: $HtmlReportPath" -ForegroundColor Green
+
+#endregion
+
+#region Email Report
+
+if ($EmailReport) {
+    if (-not $SmtpServer -or -not $EmailTo -or -not $EmailFrom) {
+        Write-Warning "Email parameters missing. Skipping email delivery."
+    } else {
+        Write-Host "Sending email report..." -ForegroundColor Cyan
+        
+        try {
+            $emailSubject = "WSUS Compliance Report - $ReportDate"
+            $emailBody = @"
+<html>
+<body style="font-family: Arial, sans-serif;">
+<h2>WSUS Compliance Report</h2>
+<p>Please find attached the latest WSUS compliance report.</p>
+
+<h3>Summary:</h3>
+<ul>
+    <li><strong>Overall Compliance:</strong> $compliancePercent%</li>
+    <li><strong>Total Systems:</strong> $totalComputers</li>
+    <li><strong>Systems Reporting (30 days):</strong> $reportingPercent%</li>
+    <li><strong>Non-Reporting Systems:</strong> $nonReportingCount</li>
+</ul>
+
+<p>For detailed information, please open the attached HTML report in your web browser.</p>
+
+<p style="color: #666; font-size: 0.9em;">Generated: $ReportDateTime</p>
+</body>
+</html>
+"@
+            
+            Send-MailMessage -From $EmailFrom `
+                           -To $EmailTo.Split(',') `
+                           -Subject $emailSubject `
+                           -Body $emailBody `
+                           -BodyAsHtml `
+                           -SmtpServer $SmtpServer `
+                           -Attachments $HtmlReportPath
+            
+            Write-Host "Email sent successfully to: $EmailTo" -ForegroundColor Green
+        }
+        catch {
+            Write-Error "Failed to send email: $_"
+        }
+    }
+}
+
+#endregion
+
+Write-Host "`nReport generation complete!" -ForegroundColor Green
+Write-Host "Report location: $HtmlReportPath" -ForegroundColor Cyan
+Write-Host "`nTo view the report, open it in your web browser." -ForegroundColor Yellow

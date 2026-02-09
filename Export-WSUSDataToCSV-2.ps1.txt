@@ -1,0 +1,186 @@
+<#
+.SYNOPSIS
+    Export WSUS data to CSV files for auditor review
+    
+.DESCRIPTION
+    Exports all WSUS compliance data to individual CSV files for easy analysis in Excel.
+    Perfect for providing raw data to auditors who want to perform their own analysis.
+    
+.PARAMETER SqlServer
+    SQL Server instance hosting SUSDB
+    
+.PARAMETER Database
+    Database name (default: SUSDB)
+    
+.PARAMETER OutputPath
+    Path for CSV output files
+    
+.EXAMPLE
+    .\Export-WSUSDataToCSV.ps1 -SqlServer "WSUSSQL01" -OutputPath "C:\AuditorData"
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$SqlServer,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$Database = "SUSDB",
+    
+    [Parameter(Mandatory=$false)]
+    [string]$OutputPath = "C:\WSUSReports\CSV"
+)
+
+# Create output directory
+if (-not (Test-Path $OutputPath)) {
+    New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
+}
+
+$ReportDate = Get-Date -Format "yyyy-MM-dd"
+
+function Invoke-SqlQuery {
+    param(
+        [string]$Query,
+        [string]$ServerInstance,
+        [string]$DatabaseName
+    )
+    
+    try {
+        $connectionString = "Server=$ServerInstance;Database=$DatabaseName;Integrated Security=True;TrustServerCertificate=True;"
+        $connection = New-Object System.Data.SqlClient.SqlConnection($connectionString)
+        $connection.Open()
+        
+        $command = $connection.CreateCommand()
+        $command.CommandText = $Query
+        $command.CommandTimeout = 300
+        
+        $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($command)
+        $dataset = New-Object System.Data.DataSet
+        $adapter.Fill($dataset) | Out-Null
+        
+        $connection.Close()
+        
+        return $dataset.Tables[0]
+    }
+    catch {
+        Write-Error "SQL Query failed: $_"
+        return $null
+    }
+}
+
+Write-Host "Exporting WSUS data to CSV files..." -ForegroundColor Cyan
+Write-Host "Output directory: $OutputPath`n" -ForegroundColor Gray
+
+# Export Overall Compliance
+Write-Host "Exporting overall compliance..." -ForegroundColor Gray
+$data = Invoke-SqlQuery -Query "SELECT * FROM vw_OverallCompliance" -ServerInstance $SqlServer -DatabaseName $Database
+if ($data) {
+    $outputFile = Join-Path $OutputPath "01_OverallCompliance_$ReportDate.csv"
+    $data | Export-Csv -Path $outputFile -NoTypeInformation -Encoding UTF8
+    Write-Host "  ✓ Saved: $outputFile" -ForegroundColor Green
+}
+
+# Export Compliance by Classification
+Write-Host "Exporting compliance by classification..." -ForegroundColor Gray
+$data = Invoke-SqlQuery -Query "SELECT * FROM vw_ComplianceByClassification ORDER BY Classification" -ServerInstance $SqlServer -DatabaseName $Database
+if ($data) {
+    $outputFile = Join-Path $OutputPath "02_ComplianceByClassification_$ReportDate.csv"
+    $data | Export-Csv -Path $outputFile -NoTypeInformation -Encoding UTF8
+    Write-Host "  ✓ Saved: $outputFile" -ForegroundColor Green
+}
+
+# Export Missing Security Updates
+Write-Host "Exporting missing security updates..." -ForegroundColor Gray
+$data = Invoke-SqlQuery -Query "SELECT * FROM vw_MissingSecurityUpdates ORDER BY DaysSinceRelease DESC" -ServerInstance $SqlServer -DatabaseName $Database
+if ($data) {
+    $outputFile = Join-Path $OutputPath "03_MissingSecurityUpdates_$ReportDate.csv"
+    $data | Export-Csv -Path $outputFile -NoTypeInformation -Encoding UTF8
+    Write-Host "  ✓ Saved: $outputFile" -ForegroundColor Green
+}
+
+# Export Non-Reporting Systems
+Write-Host "Exporting non-reporting systems..." -ForegroundColor Gray
+$data = Invoke-SqlQuery -Query "SELECT * FROM vw_NonReportingSystems ORDER BY DaysSinceLastSync DESC" -ServerInstance $SqlServer -DatabaseName $Database
+if ($data) {
+    $outputFile = Join-Path $OutputPath "04_NonReportingSystems_$ReportDate.csv"
+    $data | Export-Csv -Path $outputFile -NoTypeInformation -Encoding UTF8
+    Write-Host "  ✓ Saved: $outputFile" -ForegroundColor Green
+}
+
+# Export System Type Compliance
+Write-Host "Exporting server vs workstation compliance..." -ForegroundColor Gray
+$data = Invoke-SqlQuery -Query "SELECT * FROM vw_ComplianceBySystemType ORDER BY SystemType" -ServerInstance $SqlServer -DatabaseName $Database
+if ($data) {
+    $outputFile = Join-Path $OutputPath "05_ComplianceBySystemType_$ReportDate.csv"
+    $data | Export-Csv -Path $outputFile -NoTypeInformation -Encoding UTF8
+    Write-Host "  ✓ Saved: $outputFile" -ForegroundColor Green
+}
+
+# Export Top Non-Compliant Systems
+Write-Host "Exporting top non-compliant systems..." -ForegroundColor Gray
+$data = Invoke-SqlQuery -Query "SELECT * FROM vw_TopNonCompliantSystems" -ServerInstance $SqlServer -DatabaseName $Database
+if ($data) {
+    $outputFile = Join-Path $OutputPath "06_TopNonCompliantSystems_$ReportDate.csv"
+    $data | Export-Csv -Path $outputFile -NoTypeInformation -Encoding UTF8
+    Write-Host "  ✓ Saved: $outputFile" -ForegroundColor Green
+}
+
+# Export All Computers with Full Details
+Write-Host "Exporting complete computer inventory..." -ForegroundColor Gray
+$query = @"
+SELECT 
+    c.FullDomainName AS ComputerName,
+    cs.OSDescription AS OperatingSystem,
+    cs.LastSyncTime,
+    DATEDIFF(day, cs.LastSyncTime, GETDATE()) AS DaysSinceLastSync,
+    cs.IPAddress,
+    cs.ComputerMake AS Manufacturer,
+    cs.ComputerModel AS Model,
+    COALESCE(tg.Name, 'Unassigned') AS ComputerGroup,
+    
+    -- Update statistics
+    COUNT(DISTINCT CASE WHEN us.SummarizationState = 2 THEN us.UpdateID END) AS TotalMissingUpdates,
+    COUNT(DISTINCT CASE WHEN us.SummarizationState = 3 THEN us.UpdateID END) AS InstalledUpdates,
+    COUNT(DISTINCT CASE WHEN us.SummarizationState IN (4,5) THEN us.UpdateID END) AS FailedUpdates,
+    
+    -- Critical and Security counts
+    COUNT(DISTINCT CASE 
+        WHEN us.SummarizationState = 2 AND uc.CategoryTitle = 'Critical Updates' 
+        THEN us.UpdateID 
+    END) AS MissingCriticalUpdates,
+    COUNT(DISTINCT CASE 
+        WHEN us.SummarizationState = 2 AND uc.CategoryTitle = 'Security Updates' 
+        THEN us.UpdateID 
+    END) AS MissingSecurityUpdates
+
+FROM dbo.tbComputerTarget c
+LEFT JOIN dbo.tbComputerTargetDetail cs ON c.ComputerID = cs.TargetID
+LEFT JOIN dbo.tbUpdateStatusPerComputer us ON c.ComputerID = us.ComputerID
+LEFT JOIN dbo.tbUpdate u ON us.UpdateID = u.UpdateID AND u.IsDeclined = 0
+LEFT JOIN dbo.tbUpdateCategory uc ON u.UpdateClassificationID = uc.CategoryID
+LEFT JOIN dbo.tbComputerTargetInGroup ctg ON c.ComputerID = ctg.ComputerTargetID
+LEFT JOIN dbo.tbGroup tg ON ctg.GroupID = tg.GroupID
+
+WHERE c.IsDeleted = 0
+
+GROUP BY 
+    c.FullDomainName,
+    cs.OSDescription,
+    cs.LastSyncTime,
+    cs.IPAddress,
+    cs.ComputerMake,
+    cs.ComputerModel,
+    tg.Name
+
+ORDER BY c.FullDomainName
+"@
+
+$data = Invoke-SqlQuery -Query $query -ServerInstance $SqlServer -DatabaseName $Database
+if ($data) {
+    $outputFile = Join-Path $OutputPath "07_CompleteComputerInventory_$ReportDate.csv"
+    $data | Export-Csv -Path $outputFile -NoTypeInformation -Encoding UTF8
+    Write-Host "  ✓ Saved: $outputFile" -ForegroundColor Green
+}
+
+Write-Host "`n✓ CSV export complete!" -ForegroundColor Green
+Write-Host "All files saved to: $OutputPath" -ForegroundColor Cyan
