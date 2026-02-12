@@ -1,0 +1,295 @@
+# ============================================================================
+# WSUS Reporting Solution - Compatibility Checker
+# ============================================================================
+#
+# PURPOSE:
+#   Verifies that your WSUS/SQL Server environment is compatible with the
+#   WSUS Reporting Solution before installation.
+#
+# USAGE:
+#   .\Test-WSUSCompatibility.ps1 -SqlServer "YOUR_SERVER"
+#
+#   With SQL Authentication:
+#   .\Test-WSUSCompatibility.ps1 -SqlServer "YOUR_SERVER" -UseSqlAuth `
+#       -SqlUsername "your_user" -SqlPassword "your_pass"
+#
+# WHAT IT CHECKS:
+#   - SQL Server connectivity
+#   - SUSDB database accessibility  
+#   - SQL Server version (2008 R2+)
+#   - WSUS version
+#   - Required tables exist
+#   - Required columns exist
+#   - Sample query compatibility
+#   - Actual WSUS data presence
+#   - PowerShell version
+#   - SQL permissions
+#
+# REQUIREMENTS:
+#   - PowerShell 5.1 or higher
+#   - Network access to SQL Server
+#   - SQL account with db_datareader on SUSDB
+#
+# GITHUB: https://github.com/yourusername/wsus-reporting
+# LICENSE: MIT
+# VERSION: 1.0
+# AUTHOR: Your Name
+# ============================================================================
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$SqlServer,
+    
+    [Parameter(Mandatory=$false)]
+    [switch]$UseSqlAuth,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$SqlUsername,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$SqlPassword,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$ExportPath,
+    
+    [Parameter(Mandatory=$false)]
+    [switch]$Quiet
+)
+
+$ErrorActionPreference = "Continue"
+
+$script:TestResults = @{
+    OverallStatus = "Unknown"
+    TestsPassed = 0
+    TestsFailed = 0
+    TestsWarning = 0
+    Details = @()
+    Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    SqlServer = $SqlServer
+}
+
+function Write-TestResult {
+    param([string]$TestName, [string]$Status, [string]$Message, [string]$Details = "")
+    
+    $script:TestResults.Details += @{TestName=$TestName; Status=$Status; Message=$Message; Details=$Details}
+    
+    switch ($Status) {
+        'Pass' { 
+            $script:TestResults.TestsPassed++
+            if (-not $Quiet) { Write-Host "  [PASS] $Message" -ForegroundColor Green }
+        }
+        'Fail' { 
+            $script:TestResults.TestsFailed++
+            if (-not $Quiet) { Write-Host "  [FAIL] $Message" -ForegroundColor Red }
+        }
+        'Warning' { 
+            $script:TestResults.TestsWarning++
+            if (-not $Quiet) { Write-Host "  [WARN] $Message" -ForegroundColor Yellow }
+        }
+    }
+}
+
+function Get-SqlConnectionString {
+    if ($UseSqlAuth) {
+        return "Server=$SqlServer;Database=SUSDB;User Id=$SqlUsername;Password=$SqlPassword;TrustServerCertificate=True;Connection Timeout=10;"
+    } else {
+        return "Server=$SqlServer;Database=SUSDB;Integrated Security=True;TrustServerCertificate=True;Connection Timeout=10;"
+    }
+}
+
+function Test-SqlQuery {
+    param([string]$Query)
+    try {
+        $conn = New-Object System.Data.SqlClient.SqlConnection(Get-SqlConnectionString)
+        $conn.Open()
+        $cmd = $conn.CreateCommand()
+        $cmd.CommandText = $Query
+        $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($cmd)
+        $dataset = New-Object System.Data.DataSet
+        $adapter.Fill($dataset) | Out-Null
+        $conn.Close()
+        return @{Success=$true; Data=$dataset.Tables[0]; Error=$null}
+    }
+    catch {
+        return @{Success=$false; Data=$null; Error=$_.Exception.Message}
+    }
+}
+
+# Banner
+if (-not $Quiet) {
+    Write-Host ""
+    Write-Host "==========================================" -ForegroundColor Cyan
+    Write-Host "  WSUS Compatibility Checker" -ForegroundColor Cyan
+    Write-Host "==========================================" -ForegroundColor Cyan
+    Write-Host ""
+}
+
+# Test 1: PowerShell Version
+if (-not $Quiet) { Write-Host "[1/10] PowerShell Version..." -ForegroundColor Cyan }
+$psVer = $PSVersionTable.PSVersion
+if ($psVer.Major -ge 5 -and $psVer.Minor -ge 1) {
+    Write-TestResult "PowerShell" "Pass" "Version $($psVer.Major).$($psVer.Minor)"
+} else {
+    Write-TestResult "PowerShell" "Fail" "Version $($psVer.Major).$($psVer.Minor) too old (need 5.1+)"
+}
+
+# Test 2: Network
+if (-not $Quiet) { Write-Host "[2/10] Network Connectivity..." -ForegroundColor Cyan }
+$net = Test-NetConnection -ComputerName $SqlServer -Port 1433 -WarningAction SilentlyContinue
+if ($net.TcpTestSucceeded) {
+    Write-TestResult "Network" "Pass" "Port 1433 accessible"
+} else {
+    Write-TestResult "Network" "Fail" "Cannot reach port 1433"
+}
+
+# Test 3: SQL Connection
+if (-not $Quiet) { Write-Host "[3/10] SQL Server Connection..." -ForegroundColor Cyan }
+$result = Test-SqlQuery "SELECT @@VERSION"
+if ($result.Success) {
+    Write-TestResult "SQL Connection" "Pass" "Connected successfully"
+    $ver = $result.Data.Rows[0][0]
+    if ($ver -match "SQL Server (\d+)") {
+        $sqlVer = [int]$matches[1]
+        if ($sqlVer -ge 2012) {
+            Write-TestResult "SQL Version" "Pass" "SQL Server $sqlVer"
+        } else {
+            Write-TestResult "SQL Version" "Warning" "SQL Server $sqlVer is old"
+        }
+    }
+} else {
+    Write-TestResult "SQL Connection" "Fail" $result.Error
+}
+
+# Test 4: SUSDB Access
+if (-not $Quiet) { Write-Host "[4/10] SUSDB Database..." -ForegroundColor Cyan }
+$result = Test-SqlQuery "SELECT DB_NAME()"
+if ($result.Success) {
+    Write-TestResult "SUSDB" "Pass" "Database accessible"
+} else {
+    Write-TestResult "SUSDB" "Fail" "Cannot access SUSDB"
+}
+
+# Test 5: WSUS Version
+if (-not $Quiet) { Write-Host "[5/10] WSUS Version..." -ForegroundColor Cyan }
+$result = Test-SqlQuery "SELECT ServerVersion FROM tbConfigurationC"
+if ($result.Success) {
+    $wsusVer = $result.Data.Rows[0].ServerVersion
+    Write-TestResult "WSUS Version" "Pass" "Version $wsusVer detected"
+} else {
+    Write-TestResult "WSUS Version" "Warning" "Cannot determine version"
+}
+
+# Test 6: Required Tables
+if (-not $Quiet) { Write-Host "[6/10] Required Tables..." -ForegroundColor Cyan }
+$tables = @('tbComputerTarget','tbComputerTargetDetail','tbUpdate','tbUpdateStatusPerComputer','tbUpdateCategory','tbProperty','tbKBArticleForUpdate','tbComputerTargetInGroup','tbGroup')
+$missing = @()
+foreach ($t in $tables) {
+    $r = Test-SqlQuery "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME='$t'"
+    if (-not ($r.Success -and $r.Data.Rows[0][0] -eq 1)) { $missing += $t }
+}
+if ($missing.Count -eq 0) {
+    Write-TestResult "Tables" "Pass" "All $($tables.Count) tables exist"
+} else {
+    Write-TestResult "Tables" "Fail" "Missing: $($missing -join ', ')"
+}
+
+# Test 7: Required Columns
+if (-not $Quiet) { Write-Host "[7/10] Required Columns..." -ForegroundColor Cyan }
+$cols = @{
+    'tbComputerTarget'=@('ComputerID','FullDomainName','IsDeleted')
+    'tbComputerTargetDetail'=@('TargetID','LastSyncTime','OSDescription')
+    'tbUpdateStatusPerComputer'=@('ComputerID','UpdateID','SummarizationState')
+}
+$missingCols = @()
+foreach ($tbl in $cols.Keys) {
+    foreach ($col in $cols[$tbl]) {
+        $r = Test-SqlQuery "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='$tbl' AND COLUMN_NAME='$col'"
+        if (-not ($r.Success -and $r.Data.Rows[0][0] -eq 1)) { $missingCols += "$tbl.$col" }
+    }
+}
+if ($missingCols.Count -eq 0) {
+    Write-TestResult "Columns" "Pass" "All critical columns exist"
+} else {
+    Write-TestResult "Columns" "Fail" "Missing: $($missingCols -join ', ')"
+}
+
+# Test 8: Sample Query
+if (-not $Quiet) { Write-Host "[8/10] Sample Queries..." -ForegroundColor Cyan }
+$q = "SELECT TOP 1 c.ComputerID, c.FullDomainName FROM tbComputerTarget c LEFT JOIN tbComputerTargetDetail cs ON c.ComputerID=cs.TargetID WHERE c.IsDeleted=0"
+$r = Test-SqlQuery $q
+if ($r.Success) {
+    Write-TestResult "Sample Query" "Pass" "Complex JOIN works"
+} else {
+    Write-TestResult "Sample Query" "Fail" "Query failed: $($r.Error)"
+}
+
+# Test 9: Data Presence
+if (-not $Quiet) { Write-Host "[9/10] WSUS Data..." -ForegroundColor Cyan }
+$r = Test-SqlQuery "SELECT COUNT(*) FROM tbComputerTarget WHERE IsDeleted=0"
+if ($r.Success) {
+    $cnt = $r.Data.Rows[0][0]
+    if ($cnt -gt 0) {
+        Write-TestResult "Data" "Pass" "Found $cnt computers"
+    } else {
+        Write-TestResult "Data" "Warning" "No computers in WSUS"
+    }
+}
+
+# Test 10: Permissions
+if (-not $Quiet) { Write-Host "[10/10] Permissions..." -ForegroundColor Cyan }
+$r = Test-SqlQuery "SELECT TOP 1 * FROM tbComputerTarget"
+if ($r.Success) {
+    Write-TestResult "SELECT" "Pass" "Has SELECT permission"
+} else {
+    Write-TestResult "SELECT" "Fail" "No SELECT permission"
+}
+
+$testView = "vw_Test$(Get-Random)"
+$r = Test-SqlQuery "CREATE VIEW $testView AS SELECT 1 AS Col"
+if ($r.Success) {
+    Test-SqlQuery "DROP VIEW $testView" | Out-Null
+    Write-TestResult "CREATE VIEW" "Pass" "Can create views (for install)"
+} else {
+    Write-TestResult "CREATE VIEW" "Warning" "Cannot create views (use admin account for install)"
+}
+
+# Summary
+if (-not $Quiet) {
+    Write-Host ""
+    Write-Host "==========================================" -ForegroundColor White
+    Write-Host "  SUMMARY" -ForegroundColor White
+    Write-Host "==========================================" -ForegroundColor White
+    Write-Host "  Passed:  $($script:TestResults.TestsPassed)" -ForegroundColor Green
+    Write-Host "  Warnings: $($script:TestResults.TestsWarning)" -ForegroundColor Yellow
+    Write-Host "  Failed:  $($script:TestResults.TestsFailed)" -ForegroundColor Red
+    Write-Host ""
+}
+
+if ($script:TestResults.TestsFailed -eq 0 -and $script:TestResults.TestsWarning -eq 0) {
+    $script:TestResults.OverallStatus = "EXCELLENT"
+    if (-not $Quiet) { Write-Host "  Status: EXCELLENT - Ready!" -ForegroundColor Green }
+    $exitCode = 0
+} elseif ($script:TestResults.TestsFailed -eq 0) {
+    $script:TestResults.OverallStatus = "GOOD"
+    if (-not $Quiet) { Write-Host "  Status: GOOD - Minor warnings" -ForegroundColor Green }
+    $exitCode = 0
+} elseif ($script:TestResults.TestsFailed -le 2) {
+    $script:TestResults.OverallStatus = "MARGINAL"
+    if (-not $Quiet) { Write-Host "  Status: MARGINAL - Fix issues" -ForegroundColor Yellow }
+    $exitCode = 1
+} else {
+    $script:TestResults.OverallStatus = "INCOMPATIBLE"
+    if (-not $Quiet) { Write-Host "  Status: INCOMPATIBLE" -ForegroundColor Red }
+    $exitCode = 2
+}
+
+if (-not $Quiet) { Write-Host "" }
+
+# Export
+if ($ExportPath) {
+    $script:TestResults | ConvertTo-Json -Depth 10 | Out-File $ExportPath -Encoding UTF8
+    if (-not $Quiet) { Write-Host "[INFO] Results exported to $ExportPath" -ForegroundColor Cyan }
+}
+
+exit $exitCode
