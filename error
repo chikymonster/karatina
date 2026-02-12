@@ -8,3 +8,37 @@ Troubleshooting:
   - Check firewall allows port 1433
   - Ensure Windows Authentication is enabled
   - Confirm SUSDB database exists
+==========================================
+  WSUS Compatibility Checker
+==========================================
+
+[1/10] PowerShell Version...
+  [PASS] Version 5.1
+[2/10] Network Connectivity...
+  [PASS] Port 1433 accessible
+[3/10] SQL Server Connection...
+  [FAIL] Cannot create type. Only core types are supported in this language mode.
+[4/10] SUSDB Database...
+  [FAIL] Cannot access SUSDB
+[5/10] WSUS Version...
+  [WARN] Cannot determine version
+[6/10] Required Tables...
+  [FAIL] Missing: tbComputerTarget, tbComputerTargetDetail, tbUpdate, tbUpdateStatusPerComputer, tbUpdateCategory, tbProperty, tbKBArticleForUpdate, tbComputerTargetInGroup, tbGroup
+[7/10] Required Columns...
+  [FAIL] Missing: tbComputerTargetDetail.TargetID, tbComputerTargetDetail.LastSyncTime, tbComputerTargetDetail.OSDescription, tbUpdateStatusPerComputer.ComputerID, tbUpdateStatusPerComputer.U
+pdateID, tbUpdateStatusPerComputer.SummarizationState, tbComputerTarget.ComputerID, tbComputerTarget.FullDomainName, tbComputerTarget.IsDeleted
+[8/10] Sample Queries...
+  [FAIL] Query failed: Cannot create type. Only core types are supported in this language mode.
+[9/10] WSUS Data...
+[10/10] Permissions...
+  [FAIL] No SELECT permission
+  [WARN] Cannot create views (use admin account for install)
+
+==========================================
+  SUMMARY
+==========================================
+  Passed:  2
+  Warnings: 2
+  Failed:  6
+
+  Status: INCOMPATIBLE
